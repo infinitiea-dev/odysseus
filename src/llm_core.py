@@ -5,6 +5,8 @@ import time
 import json
 import logging
 import hashlib
+from collections import OrderedDict
+from functools import lru_cache
 from fastapi import HTTPException
 from typing import Optional, Dict, List
 
@@ -18,27 +20,31 @@ class LLMConfig:
     MAX_RETRIES = 3
     RETRY_DELAY = 0.5
     STREAM_TIMEOUT = 300
+    # Response cache bounds: keep the hottest CACHE_MAX entries, expire after CACHE_TTL.
+    CACHE_MAX = 256
+    CACHE_TTL = 300.0
 
 
 # Cache for LLM responses
-def _get_cache_key(url: str, model: str, messages: List[Dict], 
+def _get_cache_key(url: str, model: str, messages: List[Dict],
                    temperature: float, max_tokens: int) -> str:
-    """Generate cache key for LLM requests."""
-    hashable_messages = []
-    for msg in messages:
-        sorted_items = tuple(sorted(msg.items()))
-        hashable_messages.append(sorted_items)
-    
+    """Generate cache key for LLM requests.
+
+    `sort_keys=True` makes the encoding stable regardless of dict key order, and
+    `default=str` keeps it robust against any non-JSON-native values that slip
+    into message content.
+    """
     content = json.dumps({
         'url': url,
-        'model': model, 
-        'messages': hashable_messages,
+        'model': model,
+        'messages': messages,
         'temp': temperature,
         'max_tokens': max_tokens
-    }, sort_keys=True)
+    }, sort_keys=True, default=str)
     return hashlib.sha256(content.encode()).hexdigest()
 
-_response_cache = {}
+# Bounded TTL + LRU cache: most-recently-used at the end, evict from the front.
+_response_cache: "OrderedDict[str, tuple]" = OrderedDict()
 
 # Dead-host cooldown: maps host (scheme://host:port) -> unix ts when cooldown expires.
 # When a connect to a host fails, we mark it dead for DEAD_HOST_COOLDOWN seconds so
@@ -73,6 +79,7 @@ def seconds_since_model_activity(url: str, model: str) -> Optional[float]:
         return None
     return max(0.0, time.time() - ts)
 
+@lru_cache(maxsize=256)
 def _host_key(url: str) -> str:
     from urllib.parse import urlsplit
     s = urlsplit(url)
@@ -121,16 +128,23 @@ def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 def _get_cached_response(cache_key: str) -> Optional[str]:
-    """Get cached response if it exists."""
-    return _response_cache.get(cache_key)
+    """Return a cached response if present and unexpired (and mark it MRU)."""
+    entry = _response_cache.get(cache_key)
+    if entry is None:
+        return None
+    ts, response = entry
+    if time.time() - ts > LLMConfig.CACHE_TTL:
+        _response_cache.pop(cache_key, None)
+        return None
+    _response_cache.move_to_end(cache_key)
+    return response
 
 def _set_cached_response(cache_key: str, response: str) -> None:
-    """Store response in cache."""
-    if len(_response_cache) > 128:
-        keys_to_remove = list(_response_cache.keys())[:64]
-        for key in keys_to_remove:
-            del _response_cache[key]
-    _response_cache[cache_key] = response
+    """Store response as most-recently-used, evicting the oldest over capacity."""
+    _response_cache[cache_key] = (time.time(), response)
+    _response_cache.move_to_end(cache_key)
+    while len(_response_cache) > LLMConfig.CACHE_MAX:
+        _response_cache.popitem(last=False)
 
 # ── Anthropic native API adapter ──
 
@@ -140,6 +154,7 @@ ANTHROPIC_MODELS = [
     "claude-haiku-4-20250514", "claude-haiku-4", "claude-haiku-3-5-20241022", "claude-haiku-3-5",
 ]
 
+@lru_cache(maxsize=256)
 def _detect_provider(url: str) -> str:
     """Detect API provider from URL."""
     u = (url or "").lower()
@@ -162,6 +177,7 @@ def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str
     return h
 
 
+@lru_cache(maxsize=256)
 def _provider_label(url: str) -> str:
     """Human-friendly provider name for error messages."""
     u = (url or "").lower()
@@ -229,6 +245,7 @@ def _format_upstream_error(status: int, body: bytes | str, url: str) -> str:
 # Models that require max_completion_tokens instead of max_tokens
 _MAX_COMPLETION_TOKENS_MODELS = {"o1", "o3", "o4", "gpt-4.5", "gpt-5"}
 
+@lru_cache(maxsize=256)
 def _uses_max_completion_tokens(model: str) -> bool:
     """Check if a model requires max_completion_tokens instead of max_tokens."""
     if not model:
@@ -239,6 +256,7 @@ def _uses_max_completion_tokens(model: str) -> bool:
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = ("qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax", "m2-reap")
 
+@lru_cache(maxsize=256)
 def _supports_thinking(model: str) -> bool:
     """Check if model supports structured thinking output."""
     if not model:
@@ -385,6 +403,45 @@ def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
             cleaned.append(item)
     return cleaned
 
+def _prepare_messages(messages: List[Dict]) -> List[Dict]:
+    """Sanitize messages and consolidate every system message into one leading entry.
+
+    Some models (e.g. Qwen3.5) reject system messages that aren't first, so all
+    system content is merged and moved to the front. Shared by every entry point
+    so the cache key is always computed over identically-prepared messages.
+    """
+    cleaned = _sanitize_llm_messages(messages)
+    sys_parts = []
+    non_sys = []
+    for m in cleaned:
+        if m.get("role") == "system":
+            sys_parts.append(m["content"])
+        else:
+            non_sys.append(m)
+    if sys_parts:
+        return [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
+    return non_sys
+
+def _build_openai_payload(model, messages, temperature, max_tokens,
+                          stream=False, provider="openai", tools=None) -> Dict:
+    """Build an OpenAI-compatible chat payload (shared across call/stream paths)."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if stream:
+        payload["stream"] = True
+        if provider not in {"openrouter", "groq"}:
+            payload["stream_options"] = {"include_usage": True}
+    if max_tokens and max_tokens > 0:
+        tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
+        payload[tok_key] = max_tokens
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+@lru_cache(maxsize=256)
 def _normalize_anthropic_url(url: str) -> str:
     """Ensure Anthropic URL points to /v1/messages."""
     url = url.rstrip("/")
@@ -438,7 +495,8 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
              max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None, 
              timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
-    h = _provider_headers(_detect_provider(url))
+    provider = _detect_provider(url)
+    h = _provider_headers(provider)
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
     # element #0 has length 1; 2 is required".
@@ -450,22 +508,8 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     if isinstance(headers, dict):
         h.update(headers)
 
-    messages_copy = _sanitize_llm_messages(messages)
+    messages_copy = _prepare_messages(messages)
 
-    # Consolidate multiple system messages into one at the start.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m["content"])
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
-
-    provider = _detect_provider(url)
     cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -478,14 +522,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     else:
         target_url = url
-        payload = {
-            "model": model,
-            "messages": messages_copy,
-            "temperature": temperature,
-        }
-        if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
+        payload = _build_openai_payload(model, messages_copy, temperature, max_tokens, provider=provider)
     try:
         note_model_activity(target_url, model)
         r = httpx.post(target_url, headers=h, json=payload, timeout=timeout)
@@ -558,20 +595,7 @@ async def llm_call_async(
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
-    messages_copy = _sanitize_llm_messages(messages)
-
-    # Consolidate multiple system messages into one at the start.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m["content"])
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
+    messages_copy = _prepare_messages(messages)
 
     cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
     cached_response = _get_cached_response(cache_key)
@@ -586,14 +610,7 @@ async def llm_call_async(
     else:
         target_url = url
         h = _provider_headers(provider, headers)
-        payload = {
-            "model": model,
-            "messages": messages_copy,
-            "temperature": temperature,
-        }
-        if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
+        payload = _build_openai_payload(model, messages_copy, temperature, max_tokens, provider=provider)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -653,21 +670,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
-    messages_copy = _sanitize_llm_messages(messages)
-
-    # Consolidate multiple system messages into one at the start.
-    # Some models (e.g. Qwen3.5) reject system messages that aren't first.
-    sys_parts = []
-    non_sys = []
-    for m in messages_copy:
-        if m.get("role") == "system":
-            sys_parts.append(m["content"])
-        else:
-            non_sys.append(m)
-    if sys_parts:
-        messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
-    else:
-        messages_copy = non_sys
+    messages_copy = _prepare_messages(messages)
 
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
@@ -675,19 +678,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
     else:
         target_url = url
-        payload = {
-            "model": model,
-            "messages": messages_copy,
-            "temperature": temperature,
-            "stream": True,
-        }
-        if provider not in {"openrouter", "groq"}:
-            payload["stream_options"] = {"include_usage": True}
-        if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
-        if tools:
-            payload["tools"] = tools
+        payload = _build_openai_payload(model, messages_copy, temperature, max_tokens,
+                                        stream=True, provider=provider, tools=tools)
         h = _provider_headers(provider, headers)
 
     # Short connect timeout: a reachable peer answers SYN in <100ms even on
