@@ -79,6 +79,11 @@ class ChatProcessor:
             for t in toks:
                 doc_freq[t] += 1
 
+        # Average document length is constant across the whole retrieval, so
+        # compute it once here rather than re-summing the corpus inside every
+        # _bm25_score call (which made scoring O(N^2) over the memory set).
+        avg_len = max(sum(len(v) for v in mem_token_cache.values()) / N, 1)
+
         def _bm25_score(query_toks, mem_id):
             """BM25-inspired score between query and a memory."""
             mem_toks = mem_token_cache.get(mem_id, set())
@@ -86,7 +91,6 @@ class ChatProcessor:
                 return 0.0
             score = 0.0
             mem_len = len(mem_toks)
-            avg_len = max(sum(len(v) for v in mem_token_cache.values()) / N, 1)
             k1, b = 1.5, 0.75
             for qt in query_toks:
                 if qt not in mem_toks:

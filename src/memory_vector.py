@@ -94,11 +94,14 @@ class MemoryVectorStore:
         ChromaDB cosine distance = 1 - cosine_similarity.
         We convert back: similarity = 1.0 - distance.
         """
-        if not self._healthy or self._collection.count() == 0:
+        if not self._healthy:
+            return []
+        count = self._collection.count()
+        if count == 0:
             return []
 
         embeddings = self._embed([query])
-        actual_k = min(k, self._collection.count())
+        actual_k = min(k, count)
         results = self._collection.query(
             query_embeddings=embeddings,
             n_results=actual_k,

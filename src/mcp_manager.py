@@ -294,12 +294,21 @@ class McpManager:
             logger.error(f"Failed to reconnect builtin MCP server {name}: {e}")
             return False
 
+    _cached_openai_schemas = None
+    _cached_openai_schemas_key = None
+
     def get_all_openai_schemas(self, disabled_map: Optional[Dict[str, set]] = None) -> List[Dict]:
-        """Return all MCP tools in OpenAI function-calling format.
+        """Return all MCP tools in OpenAI function-calling format. Cached.
 
         Tool names are namespaced as mcp__{server_id}__{tool_name}.
         disabled_map: optional {server_id: set_of_disabled_tool_names} to filter out.
         """
+        # Cache on the same signal as get_tool_descriptions_for_prompt: the
+        # disabled map plus the number of connected servers (changes when a
+        # server connects/disconnects, which is when tools actually change).
+        cache_key = (frozenset((k, frozenset(v)) for k, v in (disabled_map or {}).items()), len(self._tools))
+        if self._cached_openai_schemas is not None and self._cached_openai_schemas_key == cache_key:
+            return self._cached_openai_schemas
         schemas = []
         for server_id, tools in self._tools.items():
             # Skip builtin Python servers — they use the code-block tool format
@@ -327,6 +336,8 @@ class McpManager:
                 }
                 schemas.append(schema)
 
+        self._cached_openai_schemas = schemas
+        self._cached_openai_schemas_key = cache_key
         return schemas
 
     def get_all_tools(self, disabled_map: Optional[Dict[str, set]] = None) -> List[Dict]:

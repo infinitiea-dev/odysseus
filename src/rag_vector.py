@@ -130,14 +130,19 @@ class VectorRAG:
             return {"success": False, "message": "No valid documents"}
 
         try:
-            # Get existing IDs to avoid duplicates
+            # Resolve every doc id, then check existence in a SINGLE ChromaDB
+            # round-trip instead of one get() per document. Dedup is still done
+            # against the collection's existing ids only (not against pending
+            # ids), so intra-batch duplicates are handled exactly as before.
+            resolved = [(f"doc_{hash(t) % 10**16}", t, m) for t, m in valid]
+            existing = self._collection.get(ids=list({doc_id for doc_id, _, _ in resolved}))
+            existing_ids = set(existing["ids"])
+
             new_texts = []
             new_metas = []
             new_ids = []
-            for t, m in valid:
-                doc_id = f"doc_{hash(t) % 10**16}"
-                existing = self._collection.get(ids=[doc_id])
-                if not existing["ids"]:
+            for doc_id, t, m in resolved:
+                if doc_id not in existing_ids:
                     new_texts.append(t)
                     new_metas.append(m)
                     new_ids.append(doc_id)
@@ -175,14 +180,15 @@ class VectorRAG:
             return []
         if not query or not isinstance(query, str):
             return []
-        if self._collection.count() == 0:
+        doc_count = self._collection.count()
+        if doc_count == 0:
             return []
 
         try:
             # Fetch extra candidates when owner-filtering
-            fetch_k = min(k * 3, max(k, 20), self._collection.count())
+            fetch_k = min(k * 3, max(k, 20), doc_count)
             if owner:
-                fetch_k = min(fetch_k * 2, self._collection.count())
+                fetch_k = min(fetch_k * 2, doc_count)
 
             query_embeddings = self._embed([query])
 
